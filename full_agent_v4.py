@@ -179,18 +179,16 @@ def ask_llm(user_text):
 
     is_generating = True
 
-    conversation.append(f"Customer: {user_text}")
-    conversation[:] = conversation[-6:]
+    conversation.append(f"User: {user_text}")
+    conversation[:] = conversation[-12:]
 
     prompt = f"""
-You are a WhatsApp automation sales agent.
-
-Speak naturally.
+You are a helpful sales assistant. Speak naturally.
 
 Conversation:
 {chr(10).join(conversation)}
 
-Agent:
+Assistant:
 """
 
     response = requests.post(
@@ -210,6 +208,8 @@ Agent:
 
     buffer = ""
 
+    full_response = []
+
     for line in response.iter_lines():
 
         if not line:
@@ -219,21 +219,30 @@ Agent:
 
         buffer += token
 
-        sentences = re.findall(r'[^.!?]*[.!?]', buffer)
+        # Split on sentence boundaries (., !, ?) or pause points (,) if buffer is getting long
+        # This allows faster TTFT (Time To First TTS)
+        if len(buffer) > 20:
+            sentences = re.findall(r'[^.!?]*[.!?]|[^,]*[,]', buffer)
+        else:
+            sentences = re.findall(r'[^.!?]*[.!?]', buffer)
 
         for s in sentences:
 
             clean = s.strip()
 
-            if len(clean) > 3:
+            if len(clean) > 2:
 
                 log("AGENT", clean)
 
                 speech_queue.put(clean)
+                
+                full_response.append(clean)
 
-                conversation.append(f"Agent: {clean}")
+        buffer = re.sub(r'[^.!?]*[.!?]|[^,]*[,]' if len(buffer) > 20 else r'[^.!?]*[.!?]', '', buffer)
 
-        buffer = re.sub(r'[^.!?]*[.!?]', '', buffer)
+    # After full response is streamed, add it as ONE entry to history
+    if full_response:
+        conversation.append(f"Assistant: {' '.join(full_response)}")
 
     is_generating = False
 
