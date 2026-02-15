@@ -5,6 +5,7 @@ import threading
 import time
 import re
 import json
+import numpy as np
 from datetime import datetime
 from queue import Queue
 from scipy.io.wavfile import write
@@ -21,11 +22,17 @@ PIPER_MODEL = r"C:\VOICE_AGENT\piper\models\en_US-lessac-medium.onnx"
 
 INPUT_AUDIO = r"C:\VOICE_AGENT\input.wav"
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "gemma:2b"
+OLLAMA_URL = "http://localhost:11434/api/chat"
+MODEL_NAME = "qwen2.5:0.5b"
 
-CPU_THREADS = 10
-RECORD_SECONDS = 2
+STOP_TOKENS_MAP = {
+    "gemma": ["<start_of_turn>", "<end_of_turn>", "user", "model", "User:", "Assistant:"],
+    "qwen": ["<|endoftext|>", "<|im_start|>", "<|im_end|>", "User:", "Assistant:"]
+}
+
+CPU_THREADS = 6
+RECORD_SECONDS = 3
+SILENCE_THRESHOLD = 500  # RMS value below which we consider it "silence"
 
 # ============================================
 # STATE
@@ -34,6 +41,13 @@ RECORD_SECONDS = 2
 speech_queue = Queue()
 
 conversation = []
+
+SYSTEM_PROMPT = """You are a natural, proactive sales agent for Whatypie. 
+Goal: Schedule a demo appointment.
+Guidelines:
+- Speak like a human on a phone call. Use brief fillers (Um, Well, Got it, I see) sparingly.
+- Be extremely concise but warm. Avoid robotic phrases.
+- Do NOT call yourself an AI or chatbot. You are part of the Whatypie team."""
 
 is_speaking = False
 is_generating = False
@@ -141,6 +155,13 @@ def record():
 
     log("REC", "End")
 
+    # Basic VAD: Return True if there is actual sound, False if it's mostly silence
+    rms = np.sqrt(np.mean(audio.astype(np.int32)**2))
+    if rms < SILENCE_THRESHOLD:
+        return False
+    
+    return True
+
 # ============================================
 # TRANSCRIBE
 # ============================================
@@ -179,30 +200,29 @@ def ask_llm(user_text):
 
     is_generating = True
 
-    conversation.append(f"Customer: {user_text}")
-    conversation[:] = conversation[-6:]
+    conversation.append({"role": "user", "content": user_text})
+    
+    # Keep last 10 messages
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation[-10:]
 
-    prompt = f"""
-You are a WhatsApp automation sales agent.
-
-Speak naturally.
-
-Conversation:
-{chr(10).join(conversation)}
-
-Agent:
-"""
+    # Get tokens for current model
+    current_stops = []
+    for key, tokens in STOP_TOKENS_MAP.items():
+        if key in MODEL_NAME.lower():
+            current_stops = tokens
+            break
 
     response = requests.post(
         OLLAMA_URL,
         json={
             "model": MODEL_NAME,
-            "prompt": prompt,
+            "messages": messages,
             "stream": True,
             "options": {
                 "num_thread": CPU_THREADS,
-                "num_predict": 30,
-                "temperature": 0.4
+                "num_predict": 40,
+                "temperature": 0.5,
+                "stop": current_stops + ["\nUser", "\nAssistant"]
             }
         },
         stream=True
@@ -210,30 +230,51 @@ Agent:
 
     buffer = ""
 
+    full_response = []
+
     for line in response.iter_lines():
 
         if not line:
             continue
 
-        token = json.loads(line.decode())["response"]
+        token = json.loads(line.decode())["message"]["content"]
+        
+        # Dynamic Hallucination Guard
+        lower_token = token.lower()
+        active_guards = [s.lower() for s in current_stops if len(s) > 2]
+        if any(x in lower_token for x in active_guards):
+            log("SYSTEM", f"Hallucination Guard Triggered: {token}")
+            break
 
         buffer += token
 
-        sentences = re.findall(r'[^.!?]*[.!?]', buffer)
+        # Split on sentence boundaries, pauses (,), or semi-colons (;)
+        # Threshold lowered to 8 chars for "Instant Reactions" (e.g., "Got it.")
+        if len(buffer) > 8:
+            sentences = re.findall(r'[^.!?]*[.!?]|[^,;]*[,;]', buffer)
+        else:
+            sentences = re.findall(r'[^.!?]*[.!?]', buffer)
 
         for s in sentences:
 
             clean = s.strip()
 
-            if len(clean) > 3:
+            if len(clean) > 2:
 
                 log("AGENT", clean)
 
                 speech_queue.put(clean)
+                
+                full_response.append(clean)
 
-                conversation.append(f"Agent: {clean}")
+        buffer = re.sub(r'[^.!?]*[.!?]|[^,;]*[,;]' if len(buffer) > 8 else r'[^.!?]*[.!?]', '', buffer)
 
-        buffer = re.sub(r'[^.!?]*[.!?]', '', buffer)
+    # After full response is streamed, add it as ONE entry to history
+    if full_response:
+        combined = ' '.join(full_response)
+        # Final cleanup in case labels leaked through
+        combined = re.sub(r'^(User|Assistant):\s*', '', combined)
+        conversation.append({"role": "assistant", "content": combined})
 
     is_generating = False
 
@@ -249,7 +290,7 @@ def preload():
         OLLAMA_URL,
         json={
             "model": MODEL_NAME,
-            "prompt": "hi",
+            "messages": [{"role": "user", "content": "hi"}],
             "keep_alive": "24h",
             "options": {"num_thread": CPU_THREADS}
         }
@@ -273,7 +314,10 @@ def run():
             time.sleep(0.05)
             continue
 
-        record()
+        has_sound = record()
+
+        if not has_sound:
+            continue
 
         text = transcribe()
 
