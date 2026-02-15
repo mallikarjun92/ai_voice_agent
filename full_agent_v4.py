@@ -5,6 +5,7 @@ import threading
 import time
 import re
 import json
+import numpy as np
 from datetime import datetime
 from queue import Queue
 from scipy.io.wavfile import write
@@ -21,11 +22,12 @@ PIPER_MODEL = r"C:\VOICE_AGENT\piper\models\en_US-lessac-medium.onnx"
 
 INPUT_AUDIO = r"C:\VOICE_AGENT\input.wav"
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL_NAME = "gemma:2b"
 
 CPU_THREADS = 10
-RECORD_SECONDS = 2
+RECORD_SECONDS = 3
+SILENCE_THRESHOLD = 500  # RMS value below which we consider it "silence"
 
 # ============================================
 # STATE
@@ -34,6 +36,16 @@ RECORD_SECONDS = 2
 speech_queue = Queue()
 
 conversation = []
+
+SYSTEM_PROMPT = """You are a helpful and proactive sales agent for whatypie which is a whatsapp business automation tool. 
+Your goal is to schedule an appointment for demo.
+
+Guidelines:
+- Speak naturally and conversationally.
+- Do NOT repeat greetings if you have already greeted the user.
+- Answer the user's question directly. 
+- If you have provided a complete answer, stop there. Do NOT add generic "How can I help you today?" fillers unless the conversation has stalled.
+- Keep responses concise."""
 
 is_speaking = False
 is_generating = False
@@ -141,6 +153,13 @@ def record():
 
     log("REC", "End")
 
+    # Basic VAD: Return True if there is actual sound, False if it's mostly silence
+    rms = np.sqrt(np.mean(audio.astype(np.int32)**2))
+    if rms < SILENCE_THRESHOLD:
+        return False
+    
+    return True
+
 # ============================================
 # TRANSCRIBE
 # ============================================
@@ -179,28 +198,22 @@ def ask_llm(user_text):
 
     is_generating = True
 
-    conversation.append(f"User: {user_text}")
-    conversation[:] = conversation[-12:]
-
-    prompt = f"""
-You are a helpful sales assistant. Speak naturally.
-
-Conversation:
-{chr(10).join(conversation)}
-
-Assistant:
-"""
+    conversation.append({"role": "user", "content": user_text})
+    
+    # Keep last 10 messages
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation[-10:]
 
     response = requests.post(
         OLLAMA_URL,
         json={
             "model": MODEL_NAME,
-            "prompt": prompt,
+            "messages": messages,
             "stream": True,
             "options": {
                 "num_thread": CPU_THREADS,
-                "num_predict": 30,
-                "temperature": 0.4
+                "num_predict": 50,
+                "temperature": 0.4,
+                "stop": ["<start_of_turn>", "<end_of_turn>", "user", "model", "User:", "Assistant:", "\nUser", "\nAssistant"]
             }
         },
         stream=True
@@ -215,7 +228,14 @@ Assistant:
         if not line:
             continue
 
-        token = json.loads(line.decode())["response"]
+        token = json.loads(line.decode())["message"]["content"]
+        
+        # Guard against hallucinated labels and control tokens
+        # If the model emits these, we stop processing the stream immediately
+        lower_token = token.lower()
+        if any(x in lower_token for x in ["user:", "assistant:", "<start", "<end"]):
+            log("SYSTEM", f"Hallucination Guard Triggered: {token}")
+            break
 
         buffer += token
 
@@ -242,7 +262,10 @@ Assistant:
 
     # After full response is streamed, add it as ONE entry to history
     if full_response:
-        conversation.append(f"Assistant: {' '.join(full_response)}")
+        combined = ' '.join(full_response)
+        # Final cleanup in case labels leaked through
+        combined = re.sub(r'^(User|Assistant):\s*', '', combined)
+        conversation.append({"role": "assistant", "content": combined})
 
     is_generating = False
 
@@ -258,7 +281,7 @@ def preload():
         OLLAMA_URL,
         json={
             "model": MODEL_NAME,
-            "prompt": "hi",
+            "messages": [{"role": "user", "content": "hi"}],
             "keep_alive": "24h",
             "options": {"num_thread": CPU_THREADS}
         }
@@ -282,7 +305,10 @@ def run():
             time.sleep(0.05)
             continue
 
-        record()
+        has_sound = record()
+
+        if not has_sound:
+            continue
 
         text = transcribe()
 
