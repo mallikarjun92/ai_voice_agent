@@ -47,7 +47,7 @@ is_speaking = False
 is_generating = False
 abort_speech = threading.Event()
 
-SYSTEM_PROMPT = "You are a Whatypie sales agent. Be human, concise, and warm. Goal: Schedule a demo."
+SYSTEM_PROMPT = "You are a Whatypie sales agent. Be human, warm, and extremely brief (max 1 sentence). Goal: Schedule demo."
 
 INSTANT_FILLERS = ["Got it.", "I see.", "Okay.", "Right.", "Mm-hmm.", "Uh-huh.", "Gotcha."]
 
@@ -62,20 +62,31 @@ class PiperEngine:
 
     def start(self, speed=1.0):
         if self.process:
-            try: self.process.terminate()
-            except: pass
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=0.2)
+            except:
+                pass
+        
+        # CLEAR THE AUDIO QUEUE to prevent Turn A audio playing in Turn B
+        while not self.audio_queue.empty():
+            try: self.audio_queue.get_nowait()
+            except: break
+
         self.last_speed = speed
         self.process = subprocess.Popen(
             [self.path, "-m", self.model, "--output_raw", "--length_scale", str(speed)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             bufsize=0 # Unbuffered for speed
         )
-        # Background thread to read stdout without blocking main TTS thread
+        # Background thread to read stdout
         def reader():
             while self.process and self.process.poll() is None:
-                chunk = self.process.stdout.read(4096)
-                if not chunk: break
-                self.audio_queue.put(chunk)
+                try:
+                    chunk = self.process.stdout.read(4096)
+                    if not chunk: break
+                    self.audio_queue.put(chunk)
+                except: break
         threading.Thread(target=reader, daemon=True).start()
 
     def speak(self, text):
@@ -136,70 +147,94 @@ log("AUDIO", "Ready")
 def tts_worker():
     global is_speaking
     engine = PiperEngine(PIPER_PATH, PIPER_MODEL)
+    last_audio_at = time.time()
     
     while True:
+        # Accurate state: Only "speaking" if we heard audio recently
+        if time.time() - last_audio_at > 0.3:
+            is_speaking = False
+
         try:
-            text = speech_queue.get(timeout=0.1)
+            text = speech_queue.get(timeout=0.05)
         except queue.Empty:
             continue
             
         if text is None: break
 
-        # Abortion Guard
+        # Abortion Guard: Purge everything if we are in abort mode
         if abort_speech.is_set():
             while not speech_queue.empty():
                 try: speech_queue.get_nowait(); speech_queue.task_done()
                 except: break
             while not engine.audio_queue.empty(): engine.audio_queue.get_nowait()
+            try:
+                audio_stream.stop()
+                audio_stream.abort()
+                audio_stream.start()
+            except: pass
             abort_speech.clear()
             continue
 
         is_speaking = True
-        
-        # Batch any immediate words
-        items = [text]
-        while not speech_queue.empty():
-            try:
-                extra = speech_queue.get_nowait()
-                if extra: items.append(extra)
-                speech_queue.task_done()
-            except: break
-        
-        combined_text = " ".join(items)
-        log("TTS", f"{combined_text}")
-        engine.speak(combined_text)
+        log("TTS", f"{text}")
+        engine.speak(text)
 
-        # Audio read loop
+        # Audio read loop: Stay here until THIS sentence is done or we need to feed NEXT sentence
         last_audio_at = time.time()
         while True:
             if abort_speech.is_set():
                 log("SYSTEM", "SPEECH ABORTED")
+                # Immediate hardware/software purge
+                try:
+                    audio_stream.stop()
+                    audio_stream.abort()
+                    audio_stream.start()
+                except: pass
+                
                 engine.start(engine.last_speed) 
                 while not speech_queue.empty():
                     try: speech_queue.get_nowait(); speech_queue.task_done()
                     except: break
-                break
+                break # Exit inner loop
             
             try:
-                chunk = engine.audio_queue.get(timeout=0.05)
-                audio_stream.write(chunk)
+                # Aggressive read timeout for responsiveness
+                chunk = engine.audio_queue.get(timeout=0.01)
+                try:
+                    audio_stream.write(chunk)
+                except sd.PortAudioError:
+                    log("SYSTEM", "Restarting audio stream...")
+                    try: audio_stream.stop(); audio_stream.start()
+                    except: pass
+                    audio_stream.write(chunk)
+                
                 last_audio_at = time.time()
+                is_speaking = True # Force high while writing
             except queue.Empty:
-                # CRITICAL: If audio is empty but more TEXT is in the queue,
-                # break immediately to send the new text to the engine.
+                # If MORE text arrived while reading audio, feed it and CONTINUE reading
                 if not speech_queue.empty():
-                    break
-                    
-                # If LLM is done and we haven't heard audio for 300ms, assume sentence done.
-                if not is_generating and (time.time() - last_audio_at > 0.3):
+                    try:
+                        next_part = speech_queue.get_nowait()
+                        if next_part:
+                            log("TTS", next_part)
+                            engine.speak(next_part)
+                        speech_queue.task_done()
+                    except: pass
+                    continue # Stay in loop to keep reading audio!
+
+                # Done when: No next text AND no audio for 0.4s (break to allow outer loop to check queue)
+                if time.time() - last_audio_at > 0.4:
                     break
                 
-                # Check for extremely slow generation
-                if time.time() - last_audio_at > 2.0:
+                # Critical safety: if LLM is done and we waited 1.5s, definitely done
+                if not is_generating and (time.time() - last_audio_at > 1.5):
+                    break
+                
+                # Safety break for absolute stalls
+                if time.time() - last_audio_at > 5.0:
                     break
                 continue
 
-        is_speaking = False
         speech_queue.task_done()
 
 threading.Thread(target=tts_worker, daemon=True).start()
@@ -229,7 +264,7 @@ def record():
         rms = np.sqrt(np.mean(data.astype(np.float32)**2))
         
         if rms > 1500: # Threshold for "active" voice
-            if is_speaking:
+            if is_speaking or is_generating:
                 abort_speech.set()
             last_voice_at = time.time()
             voice_detected = True
@@ -311,6 +346,9 @@ def ask_llm(user_text):
     full_response = []
 
     for line in response.iter_lines():
+        if abort_speech.is_set():
+            log("LLM", "Aborted")
+            break
         if not line: continue
         token = json.loads(line.decode())["message"]["content"]
         
