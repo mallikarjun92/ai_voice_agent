@@ -93,7 +93,7 @@ def tts_worker():
             time.sleep(random.uniform(0.1, 0.4))
 
         # Randomize speech speed for human feel
-        speed = random.uniform(0.95, 1.05)
+        speed = random.uniform(1.00, 1.10)
         log("TTS", f"({speed:.2f}x) {text}")
 
         piper = subprocess.Popen(
