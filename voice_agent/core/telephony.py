@@ -28,17 +28,36 @@ class TelephonyHandler:
 
     def is_call_active(self):
         try:
+            # Check telephony registry for precise state
             result = subprocess.run(
                 ["adb", "shell", "dumpsys", "telephony.registry"],
                 capture_output=True,
                 text=True,
                 timeout=2
             )
-            # mCallState=2 usually means ACTIVE (Off-hook)
-            # mCallState=1 is Ringing
-            # mCallState=0 is Idle
-            return "mCallState=2" in result.stdout
-        except:
+            stdout = result.stdout
+
+            # mCallState=2 is Off-hook (broad)
+            # mPreciseCallState=3 is ACTIVE (specific)
+            # Some devices use 'mForegroundCallState=1' for active
+            
+            is_active = "mPreciseCallState=3" in stdout or "mForegroundCallState=1" in stdout
+            
+            # Fallback to broader check if precise isn't found, but maybe with a delay
+            if not is_active and "mCallState=2" in stdout:
+                # If we only have mCallState=2, we might still be dialing.
+                # We'll check dumpsys telecom for 'State: ACTIVE' as a second opinion.
+                telecom_result = subprocess.run(
+                    ["adb", "shell", "dumpsys", "telecom"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                is_active = "State: ACTIVE" in telecom_result.stdout
+
+            return is_active
+        except Exception as e:
+            log("SYSTEM", f"Connection check error: {e}")
             return False
 
     def end_call(self):

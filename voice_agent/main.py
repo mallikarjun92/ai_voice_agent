@@ -24,11 +24,15 @@ def main():
     # 2. Audio Setup (Hybrid Support)
     audio.list_devices()
     try:
-        choice = input("\nSelect Audio Input Device ID (Enter for default): ").strip()
-        if choice:
-            audio.set_input_device(int(choice))
+        in_choice = input("\nSelect Audio Input Device ID (Enter for default): ").strip()
+        if in_choice:
+            audio.set_input_device(int(in_choice))
+        
+        out_choice = input("Select Audio Output Device ID (Enter for default): ").strip()
+        if out_choice:
+            audio.set_output_device(int(out_choice))
     except ValueError:
-        log("SYSTEM", "Using default input device.")
+        log("SYSTEM", "Using default devices where not specified.")
     
     output_stream = audio.create_output_stream()
     
