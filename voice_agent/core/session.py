@@ -6,6 +6,7 @@ class SessionState:
         self.is_generating = False
         self.abort_speech = threading.Event()
         self.conversation = []
+        self.speech_start_time = 0
 
     def abort(self):
         self.abort_speech.set()

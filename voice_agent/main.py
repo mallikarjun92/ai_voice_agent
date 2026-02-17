@@ -21,37 +21,49 @@ def main():
     audio = AudioHandler()
     telephony = TelephonyHandler(TARGET_NUMBER)
     
-    # 2. Audio Setup (Hybrid Support)
-    audio.list_devices()
-    try:
-        in_choice = input("\nSelect Audio Input Device ID (Enter for default): ").strip()
-        if in_choice:
-            audio.set_input_device(int(in_choice))
-        
-        out_choice = input("Select Audio Output Device ID (Enter for default): ").strip()
-        if out_choice:
-            audio.set_output_device(int(out_choice))
-    except ValueError:
-        log("SYSTEM", "Using default devices where not specified.")
+    # 2. Setup Mode
+    print("\n--- Start Mode ---")
+    print("1. Normal (Dial Phone)")
+    print("2. Test Mode (No Dial, Default Audio)")
+    mode_choice = input("Select Mode [1]: ").strip() or "1"
+    
+    is_test_mode = mode_choice == "2"
+    
+    if is_test_mode:
+        log("SYSTEM", "TEST MODE: Skipping dial and using default audio devices.")
+    else:
+        # 2b. Audio Setup (Hybrid Support)
+        audio.list_devices()
+        try:
+            in_choice = input("\nSelect Audio Input Device ID (Enter for default): ").strip()
+            if in_choice:
+                audio.set_input_device(int(in_choice))
+            
+            out_choice = input("Select Audio Output Device ID (Enter for default): ").strip()
+            if out_choice:
+                audio.set_output_device(int(out_choice))
+        except ValueError:
+            log("SYSTEM", "Using default devices where not specified.")
     
     output_stream = audio.create_output_stream()
     
-    # 3. Initialize Engines
+    # ... Initialize Engines ...
     stt = STTEngine()
     llm = LLMEngine()
-    tts = TTSEngine(output_stream, session)
+    tts = TTSEngine(audio, session)
     
     log("SYSTEM", "AGENT INITIALIZED & READY")
     
-    # 4. Dialing Sequence
-    log("SYSTEM", "Starting call sequence...")
-    telephony.dial()
-    
-    # Wait for connection
-    while not telephony.is_call_active():
-        time.sleep(1)
-    
-    log("SYSTEM", "Call connected!")
+    if not is_test_mode:
+        # 4. Dialing Sequence
+        log("SYSTEM", "Starting call sequence...")
+        telephony.dial()
+        
+        # Wait for connection
+        while not telephony.is_call_active():
+            time.sleep(1)
+        
+        log("SYSTEM", "Call connected!")
     
     # First greeting
     tts.put("Hello, this is Mallikarjun from Whatypie. I wanted to quickly show how you can automate WhatsApp communication.")
@@ -59,8 +71,8 @@ def main():
     # 5. Main Conversation Loop
     try:
         while True:
-            # Check if call still active
-            if not telephony.is_call_active():
+            # Check if call still active (only in Normal mode)
+            if not is_test_mode and not telephony.is_call_active():
                 log("SYSTEM", "Call ended by remote party.")
                 break
             
@@ -84,7 +96,8 @@ def main():
     except KeyboardInterrupt:
         log("SYSTEM", "Shutting down...")
     finally:
-        telephony.end_call()
+        if not is_test_mode:
+            telephony.end_call()
         output_stream.stop()
         output_stream.close()
 

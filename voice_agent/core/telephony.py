@@ -33,9 +33,11 @@ class TelephonyHandler:
                 ["adb", "shell", "dumpsys", "telephony.registry"],
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='ignore',
                 timeout=2
             )
-            stdout = result.stdout
+            stdout = result.stdout or ""
 
             # mCallState=2 is Off-hook (broad)
             # mPreciseCallState=3 is ACTIVE (specific)
@@ -51,9 +53,12 @@ class TelephonyHandler:
                     ["adb", "shell", "dumpsys", "telecom"],
                     capture_output=True,
                     text=True,
+                    encoding='utf-8',
+                    errors='ignore',
                     timeout=2
                 )
-                is_active = "State: ACTIVE" in telecom_result.stdout
+                stdout_telecom = telecom_result.stdout or ""
+                is_active = "State: ACTIVE" in stdout_telecom
 
             return is_active
         except Exception as e:

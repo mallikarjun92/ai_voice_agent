@@ -30,26 +30,43 @@ class PiperEngine:
         self.last_speed = speed
         self.process = subprocess.Popen(
             [self.path, "-m", self.model, "--output_raw", "--length_scale", str(speed)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             bufsize=0
         )
         
         def reader():
-            while self.process and self.process.poll() is None:
-                try:
-                    chunk = self.process.stdout.read(4096)
-                    if not chunk: break
+            try:
+                while self.process and self.process.poll() is None:
+                    # Reverting to read() as read1() is not available on FileIO
+                    # Using a smaller chunk size to reduce latency
+                    chunk = self.process.stdout.read(1024)
+                    if not chunk: 
+                        log("PIPER", "End of stdout stream (Piper closed)")
+                        break
                     self.audio_queue.put(chunk)
-                except: break
+            except Exception as e:
+                log("PIPER", f"Reader thread error: {e}")
         threading.Thread(target=reader, daemon=True).start()
+
+        def err_reader():
+            try:
+                while self.process and self.process.poll() is None:
+                    line = self.process.stderr.readline()
+                    if not line: break
+                    log("PIPER_ERR", line.decode().strip())
+            except: pass
+        threading.Thread(target=err_reader, daemon=True).start()
 
     def speak(self, text):
         if not self.process or self.process.poll() is not None:
+            log("PIPER", "Restarting process for new text.")
             self.start(self.last_speed)
         try:
+            log("PIPER", f"Speaking: [{text.strip()}]")
             self.process.stdin.write((text.strip() + "\n").encode())
             self.process.stdin.flush()
-        except:
+        except Exception as e:
+            log("PIPER", f"Write error: {e}")
             self.start(self.last_speed)
             self.process.stdin.write((text.strip() + "\n").encode())
             self.process.stdin.flush()
@@ -59,8 +76,8 @@ class PiperEngine:
             self.process.terminate()
 
 class TTSEngine:
-    def __init__(self, audio_stream, session):
-        self.audio_stream = audio_stream
+    def __init__(self, audio_handler, session):
+        self.audio_handler = audio_handler
         self.session = session
         self.speech_queue = queue.Queue()
         self.engine = PiperEngine(PIPER_PATH, PIPER_MODEL)
@@ -76,7 +93,9 @@ class TTSEngine:
         
         while True:
             if time.time() - last_audio_at > 0.3:
-                self.session.is_speaking = False
+                # Only lower the flag if the audio handler itself is empty
+                if not self.audio_handler.is_playing():
+                    self.session.is_speaking = False
 
             try:
                 text = self.speech_queue.get(timeout=0.05)
@@ -91,6 +110,7 @@ class TTSEngine:
                 continue
 
             self.session.is_speaking = True
+            self.session.speech_start_time = time.time()
             log("TTS", f"{text}")
             self.engine.speak(text)
 
@@ -104,32 +124,38 @@ class TTSEngine:
                     break
                 
                 try:
-                    chunk = self.engine.audio_queue.get(timeout=0.01)
-                    try:
-                        self.audio_stream.write(chunk)
-                    except sd.PortAudioError:
-                        log("SYSTEM", "Restarting audio stream...")
-                        try: self.audio_stream.stop(); self.audio_stream.start()
-                        except: pass
-                        self.audio_stream.write(chunk)
+                    chunk = self.engine.audio_queue.get(timeout=0.05)
+                    # Feed the audio handler's queue for callback-based playback
+                    self.audio_handler.out_queue.put(chunk)
                     
                     last_audio_at = time.time()
                     self.session.is_speaking = True
                 except queue.Empty:
+                    # Check if there's more text coming in the speech queue
                     if not self.speech_queue.empty():
                         try:
                             next_part = self.speech_queue.get_nowait()
                             if next_part:
                                 log("TTS", next_part)
                                 self.engine.speak(next_part)
+                                last_audio_at = time.time() # CRITICAL: Reset timer for next part
                             self.speech_queue.task_done()
                         except: pass
                         continue
 
-                    if time.time() - last_audio_at > 0.4:
-                        break
-                    if not self.session.is_generating and (time.time() - last_audio_at > 1.5):
-                        break
+                    # Timeout logic:
+                    # 1. If we are still generating text, be very patient (waiting for LLM)
+                    # 2. If we are done generating, wait up to 2 seconds for Piper to finish its buffer
+                    elapsed = time.time() - last_audio_at
+                    
+                    if self.session.is_generating:
+                        if elapsed > 5.0: # Patient with LLM (Max wait)
+                            log("TTS_DEBUG", "Worker timed out waiting for LLM audio.")
+                            break
+                    else:
+                        if elapsed > 2.0: # Patient with Piper (Max wait)
+                            log("TTS_DEBUG", "Worker timed out waiting for Piper finish.")
+                            break
                     continue
 
             self.speech_queue.task_done()
@@ -141,8 +167,8 @@ class TTSEngine:
         while not self.engine.audio_queue.empty():
             try: self.engine.audio_queue.get_nowait()
             except: break
-        try:
-            self.audio_stream.stop()
-            self.audio_stream.abort()
-            self.audio_stream.start()
-        except: pass
+        while not self.audio_handler.out_queue.empty():
+            try: self.audio_handler.out_queue.get_nowait()
+            except: break
+        # The stream itself is now managed by AudioHandler, but we can stop/start it if needed via session logic if we had it.
+        # However, clearing the queue is usually enough for the callback to start playing silence.
