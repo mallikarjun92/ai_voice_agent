@@ -46,6 +46,7 @@ def main():
             log("SYSTEM", "Using default devices where not specified.")
     
     output_stream = audio.create_output_stream()
+    audio.start_background_recording()
     
     # ... Initialize Engines ...
     stt = STTEngine()
@@ -66,7 +67,7 @@ def main():
         log("SYSTEM", "Call connected!")
     
     # First greeting
-    tts.put("Hello, this is Mallikarjun from Whatypie. I wanted to quickly show how you can automate WhatsApp communication.")
+    tts.put("Hello, this is Alex from Whatypie. I wanted to quickly show how you can automate WhatsApp communication.")
     
     # 5. Main Conversation Loop
     try:
@@ -98,6 +99,7 @@ def main():
     finally:
         if not is_test_mode:
             telephony.end_call()
+        audio.stop_background_recording()
         output_stream.stop()
         output_stream.close()
 

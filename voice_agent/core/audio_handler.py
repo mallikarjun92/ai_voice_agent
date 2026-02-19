@@ -14,6 +14,9 @@ class AudioHandler:
         self.output_device = None
         self.speech_start_time = 0
         self.out_queue = queue.Queue()
+        self.in_queue = queue.Queue()
+        self.input_stream = None
+        self.input_info = None
 
     def list_devices(self):
         devices = sd.query_devices()
@@ -45,71 +48,105 @@ class AudioHandler:
         except Exception as e:
             log("AUDIO", f"ERROR: Invalid output device {device_id}: {e}")
 
-    def record(self, session, max_record_time=10.0, silence_limit=0.8, initial_timeout=3.0):
-        log("REC", "Start" if not session.is_speaking else "LISTENING (DURING SPEECH)")
-        recorded_chunks = []
-        
-        # VAD State
-        last_voice_at = time.time()
-        voice_detected = False
-        
-        def callback(indata, frames, time_info, status):
-            nonlocal last_voice_at, voice_detected
-            # Calculate RMS to detect voice
-            data = np.frombuffer(indata, dtype=np.int16)
-            rms = np.sqrt(np.mean(data.astype(np.float32)**2))
-            
-            # Sensitivity check: If we are speaking, we need a higher threshold to interrupt
-            # (Helps with echo/loopback scenarios like Stereo Mix)
-            effective_threshold = VAD_THRESHOLD
-            
-            if session.is_speaking:
-                # Provide a grace period at the start of speech to avoid self-interruption from echo
-                time_since_speech = time.time() - session.speech_start_time
-                if time_since_speech < 2.0: # 2 second grace period
-                    effective_threshold *= 4.0 # Much higher threshold during start
-                else:
-                    effective_threshold *= 2.0 # Standard speaking threshold
-            
-            if rms > effective_threshold: 
-                if session.is_speaking or session.is_generating:
-                    log("AUDIO", "INTERRUPTION DETECTED")
-                    session.abort()
-                last_voice_at = time.time()
-                voice_detected = True
-                
-            recorded_chunks.append(indata[:])
+    def start_background_recording(self):
+        """Starts a persistent input stream to avoid hardware toggle stutters."""
+        if self.input_stream and self.input_stream.active:
+            return
 
         try:
-            # Dynamically detect preferred settings for the selected device
-            info = sd.query_devices(self.input_device, 'input')
-            fs = int(info['default_samplerate'])
-            channels = int(info['max_input_channels'])
+            # Query and cache device info
+            self.input_info = sd.query_devices(self.input_device, 'input')
+            fs = int(self.input_info['default_samplerate'])
+            channels = int(self.input_info['max_input_channels'])
             
-            log("AUDIO", f"Recording on {info['name']} ({fs}Hz, {channels}ch)")
+            log("AUDIO", f"Starting background recording on {self.input_info['name']} ({fs}Hz, {channels}ch)")
             
-            with sd.RawInputStream(samplerate=fs, channels=channels, dtype='int16', 
-                                  device=self.input_device, callback=callback):
-                start_time = time.time()
-                while time.time() - start_time < max_record_time:
-                    time.sleep(0.05)
-                    curr_time = time.time()
+            def callback(indata, frames, time_info, status):
+                self.in_queue.put(indata[:])
+
+            self.input_stream = sd.RawInputStream(
+                samplerate=fs, 
+                channels=channels, 
+                dtype='int16', 
+                device=self.input_device, 
+                callback=callback
+            )
+            self.input_stream.start()
+            return True
+        except Exception as e:
+            log("AUDIO", f"Failed to start background recording: {e}")
+            return False
+
+    def stop_background_recording(self):
+        if self.input_stream:
+            self.input_stream.stop()
+            self.input_stream.close()
+            self.input_stream = None
+
+    def record(self, session, max_record_time=10.0, silence_limit=0.8, initial_timeout=3.0):
+        log("REC", "Start" if not session.is_speaking else "LISTENING (DURING SPEECH)")
+        
+        if not self.input_stream or not self.input_stream.active:
+            if not self.start_background_recording():
+                return False
+
+        # Flush old audio from queue
+        while not self.in_queue.empty():
+            try: self.in_queue.get_nowait()
+            except: break
+
+        recorded_chunks = []
+        last_voice_at = time.time()
+        voice_detected = False
+        start_time = time.time()
+        
+        fs = int(self.input_info['default_samplerate'])
+        channels = int(self.input_info['max_input_channels'])
+
+        try:
+            while time.time() - start_time < max_record_time:
+                try:
+                    # Non-blocking check for new audio chunk (50ms timeout)
+                    indata = self.in_queue.get(timeout=0.05)
+                    recorded_chunks.append(indata)
                     
+                    # Calculate RMS for VAD
+                    data = np.frombuffer(indata, dtype=np.int16)
+                    rms = np.sqrt(np.mean(data.astype(np.float32)**2))
+                    
+                    effective_threshold = VAD_THRESHOLD
+                    if session.is_speaking:
+                        time_since_speech = time.time() - session.speech_start_time
+                        if time_since_speech < 2.0:
+                            effective_threshold *= 4.0
+                        else:
+                            effective_threshold *= 2.0
+                    
+                    if rms > effective_threshold:
+                        if session.is_speaking or session.is_generating:
+                            log("AUDIO", "INTERRUPTION DETECTED")
+                            session.abort()
+                        last_voice_at = time.time()
+                        voice_detected = True
+                    
+                    # Check break conditions
+                    curr_time = time.time()
                     if voice_detected:
                         if (curr_time - last_voice_at) > silence_limit:
                             break
                     else:
                         if (curr_time - start_time) > initial_timeout:
                             break
+                except queue.Empty:
+                    continue
         except Exception as e:
-            log("AUDIO", f"Recording error: {e}")
+            log("AUDIO", f"Recording loop error: {e}")
             return False
 
         if not recorded_chunks: return False
         audio_bytes = b''.join(recorded_chunks)
         audio = np.frombuffer(audio_bytes, dtype=np.int16)
         
-        # Downmix to mono if stereo for downstream engines (Whisper usually wants mono)
         if channels > 1:
             audio = audio.reshape(-1, channels).mean(axis=1).astype(np.int16)
         
@@ -127,16 +164,8 @@ class AudioHandler:
     def create_output_stream(self, samplerate=SAMPLERATE):
         # Using a simple buffer to handle Piper's variable chunk sizes
         self.out_buffer = b''
-        
-        def buffered_callback(outdata, frames, time_info, status):
-            needed = len(outdata)
-            while len(self.out_buffer) < needed:
-                try:
-                    self.out_buffer += self.out_queue.get_nowait()
-                except queue.Empty:
-                    break
-            
         self.cb_count = 0
+
         def buffered_callback(outdata, frames, time_info, status):
             needed = len(outdata)
             self.cb_count += 1
@@ -153,7 +182,6 @@ class AudioHandler:
                 self.out_buffer = self.out_buffer[needed:]
             else:
                 if len(self.out_buffer) > 0:
-                    # log("AUDIO", f"Buffer underflow in callback: {len(self.out_buffer)} bytes available")
                     outdata[:len(self.out_buffer)] = self.out_buffer
                     outdata[len(self.out_buffer):] = b'\x00' * (needed - len(self.out_buffer))
                     self.out_buffer = b''
@@ -166,7 +194,7 @@ class AudioHandler:
                 samplerate=samplerate,
                 channels=1,
                 dtype='int16',
-                blocksize=1024, # Smaller blocksize for lower latency
+                blocksize=2048, # Increased blocksize to prevent micro-stutters during context switching
                 device=self.output_device,
                 callback=buffered_callback
             )

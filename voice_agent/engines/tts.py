@@ -138,7 +138,7 @@ class TTSEngine:
                             if next_part:
                                 log("TTS", next_part)
                                 self.engine.speak(next_part)
-                                last_audio_at = time.time() # CRITICAL: Reset timer for next part
+                                last_audio_at = time.time()
                             self.speech_queue.task_done()
                         except: pass
                         continue
